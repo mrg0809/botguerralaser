@@ -4,6 +4,9 @@ Backend module para el webhook de Facebook Messenger y la integración con Groq.
 import os
 import asyncio
 from typing import Dict, Any, Optional, List
+
+import chromadb
+from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import httpx
 from groq import AsyncGroq
@@ -14,35 +17,131 @@ load_dotenv()
 FB_PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN")
 FB_VERIFY_TOKEN = os.getenv("FB_VERIFY_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHROMA_DB_DIR = os.path.join(BASE_DIR, "chroma_db")
+CHROMA_COLLECTION = "productos"
+EMBED_MODEL = "intfloat/e5-small"
 
 # System prompt para el bot
 SYSTEM_PROMPT = """Eres un asistente virtual de GUERRA LÁSER, empresa de venta de maquinaria láser en México.
 
-REGLAS ESTRICTAS:
-1. USA SOLAMENTE la información exacta del contexto proporcionado.
-2. NO menciones sucursales, sitios web, ni secciones que NO aparezcan en el contexto.
-3. NO inventes datos de contacto, ubicaciones, productos, precios o servicios.
-4. Si el contexto muestra UNA ubicación, di que es LA ubicación (no "una de nuestras sucursales").
-5. Copia direcciones, teléfonos y correos EXACTAMENTE como aparecen en el contexto.
-6. Cuando haya un producto relevante, responde con TODAS las especificaciones disponibles en el contexto para ese producto (no omitas campos que aparezcan).
-7. IMPORTANTE: Cuando menciones un producto que tenga el campo "link_mercadolibre" en el contexto, SIEMPRE incluye ese link en tu respuesta para que el usuario pueda ver más detalles. Preséntalo de forma natural como "Puedes ver más detalles aquí: [link]" o "Ver publicación: [link]".
-8. Si la pregunta es genérica (saludo, “qué venden”, “catálogo”, “categorías”), sugiere 3 a 5 categorías con su enlace exactamente como aparezcan en el contexto.
-9. NUNCA inventes marcas, modelos, precios ni enlaces. Solo puedes usar los campos del contexto: `link_mercadolibre` de productos o los links de categoría de "CATEGORÍA / LINK". Si no hay productos en el contexto, responde únicamente con las categorías disponibles; si tampoco hay categorías, responde 'ESCALATE'.
-10. Si el usuario pide "todas" las opciones o menciona una categoría (ej. CO2, fibra, CNC), responde con la(s) categorías correspondientes y sus links EXACTOS del contexto; no inventes dominios ni URLs.
-11. Si no hay entrada [Productos relevantes] en el contexto, NO inventes un producto: responde únicamente con las categorías disponibles y sus enlaces. Si tampoco hay categorías, responde 'ESCALATE'.
-12. SOLO puedes dar links de MercadoLibre que vengan en el contexto (link_mercadolibre de productos o los LINK de las CATEGORÍAS). NO uses dominios externos ni inventes URLs. Si no hay links disponibles en el contexto, responde 'ESCALATE'.
+REGLAS CRÍTICAS - PRIORIDAD MÁXIMA:
+1. SI HAY [Productos relevantes] EN EL CONTEXTO: Siempre responde con esos productos y sus links de MercadoLibre. NUNCA ESCALATES si hay productos disponibles.
+2. SIEMPRE incluye el campo "link_mercadolibre" cuando está disponible. Preséntalo como: "Puedes ver más detalles: [link]" o "Ver en MercadoLibre: [link]"
+3. Responde con los productos que encuentres, incluyendo especificaciones disponibles (TITLE, BRAND, MODEL, PRICE, etc.).
 
-Escalación (solo si falta info o piden humano):
-- Si la pregunta es técnica compleja o piden hablar con una persona, responde solo la palabra 'ESCALATE'.
-- Si el contexto no contiene la información solicitada, responde solo la palabra 'ESCALATE'.
+REGLAS DE INFORMACIÓN:
+4. USA SOLAMENTE la información exacta del contexto proporcionado.
+5. NO inventes datos de contacto, ubicaciones, productos, precios o servicios.
+6. Si hay especificaciones en [Productos relevantes], inclúyelas en tu respuesta.
+7. Si la pregunta es genérica (saludo, "qué venden", "catálogo"), sugiere 3-5 categorías con links exactos del contexto.
 
-Responde de forma directa, concisa y profesional. No digas "consulta con un representante" si tienes la información en el contexto; en ese caso responde completo."""
+REGLAS DE LINKS Y URLS:
+8. SOLO puedes dar links de MercadoLibre que vengan en el contexto (link_mercadolibre de productos o LINK de CATEGORÍAS).
+9. NO inventes marcas, modelos, precios ni URLs externas.
+10. Si un producto tiene link_mercadolibre en [Productos relevantes], DEBES incluirlo en tu respuesta.
+
+REGLAS DE ESCALACIÓN (solo en estos casos específicos):
+11. Escala (responde 'ESCALATE') SOLO si:
+    a) La pregunta requiere acción técnica compleja (instalación, mantenimiento, asesoría personalizada)
+    b) El usuario pide hablar con una persona o especialista
+    c) El contexto NO contiene NADA relevante (ni [Productos relevantes] ni [Categorias recomendadas])
+12. NO escalíques si hay [Productos relevantes] o [Categorias recomendadas] disponibles.
+
+ESTILO:
+- Responde de forma directa, concisa y profesional.
+- Si tienes información en el contexto, úsala; no sugieras escalar sin razón.
+
+IMPORTANTE: [Productos relevantes] contiene búsqueda semántica. Úsalos SIEMPRE que estén presentes."""
 
 # Cliente de Groq
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # Buffer en memoria para exponer mensajes al frontend vía polling
 MESSAGE_BUFFER = []
+
+# Clientes/cache para Chroma y embeddings
+_chroma_collection = None
+_embedder = None
+_embedder_ready = False
+
+
+def precargar_embedder():
+    """Pre-carga el modelo de embeddings en background."""
+    global _embedder, _embedder_ready
+    try:
+        print(f"[Init] Pre-cargando modelo de embeddings: {EMBED_MODEL}...")
+        _embedder = SentenceTransformer(EMBED_MODEL)
+        _embedder_ready = True
+        print(f"[Init] ✓ Modelo cargado exitosamente")
+    except Exception as e:
+        print(f"[Init] ✗ Error al cargar modelo: {e}")
+        _embedder = None
+        _embedder_ready = False
+
+
+def get_embedder():
+    """Retorna el modelo de embeddings (debe estar pre-cargado)."""
+    global _embedder
+    if _embedder is None:
+        raise RuntimeError("Embedder no está inicializado. Ejecuta precargar_embedder() primero.")
+    return _embedder
+
+
+def get_chroma_collection():
+    """Obtiene o crea la colección persistente de productos."""
+    global _chroma_collection
+    if _chroma_collection is None:
+        client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+        _chroma_collection = client.get_or_create_collection(CHROMA_COLLECTION)
+    return _chroma_collection
+
+
+def buscar_productos_semanticos(mensaje: str, filtros_categoria: Optional[List[str]] = None, top_k: int = 7) -> List[Dict[str, Any]]:
+    """Consulta Chroma y devuelve metadatos de productos relevantes."""
+    # Si Chroma no está inicializado o embedder no está listo, fallback a heurística
+    if not os.path.exists(CHROMA_DB_DIR):
+        print("[Chroma] chroma_db/ no existe, usando fallback de heurística")
+        return []
+    
+    if not _embedder_ready:
+        print("[Chroma] Embedder aún no está listo, usando fallback de heurística")
+        return []
+
+    try:
+        print("[Chroma] Iniciando búsqueda semántica...")
+        collection = get_chroma_collection()
+        embedder = get_embedder()
+
+        query_text = f"query: {mensaje}"
+        print(f"[Chroma] Codificando query: {query_text[:50]}...")
+        query_emb = embedder.encode([query_text], convert_to_numpy=True).tolist()
+        print(f"[Chroma] Query codificada, ejecutando búsqueda...")
+
+        where = None
+        if filtros_categoria:
+            # Usa $or con contains para filtrar categorías aproximadas
+            where = {"$or": [{"categoria": {"$contains": f}} for f in filtros_categoria]}
+            print(f"[Chroma] Aplicando filtros de categoría: {filtros_categoria}")
+
+        result = collection.query(query_embeddings=query_emb, n_results=top_k, where=where)
+        metadatas = result.get("metadatas", [])
+        
+        if not metadatas:
+            print("[Chroma] No se encontraron resultados")
+            return []
+        
+        # metadatas es una lista de listas
+        print(f"[Chroma] ✓ Encontrados {len(metadatas[0])} productos relevantes")
+        return metadatas[0]
+    except Exception as e:
+        print(f"[Chroma] ✗ Error en búsqueda semántica: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def cargar_contexto_completo() -> dict:
@@ -60,7 +159,7 @@ def cargar_contexto_completo() -> dict:
 
     # Contexto general
     try:
-        with open("Contexto_tienda.txt", "r", encoding="utf-8") as f:
+        with open(os.path.join(BASE_DIR, "Contexto_tienda.txt"), "r", encoding="utf-8") as f:
             contexto["tienda"] = f.read().strip()
             contexto["categorias_links"] = extraer_categorias_links(contexto["tienda"])
     except FileNotFoundError:
@@ -69,7 +168,7 @@ def cargar_contexto_completo() -> dict:
     # Inventario JSONL
     try:
         import json
-        with open("contexto_bot.jsonl", "r", encoding="utf-8") as f:
+        with open(os.path.join(BASE_DIR, "contexto_bot.jsonl"), "r", encoding="utf-8") as f:
             for linea in f:
                 linea = linea.strip()
                 if linea:
@@ -122,7 +221,7 @@ def filtrar_categorias_por_keywords(categorias: List[Dict[str, str]], mensaje_lo
     resultado = []
     keywords_map = [
         ("co2", ["co2"]),
-        ("fibra", ["fibra", "fiber"]),
+        ("fibra", ["fibra", "fiber", "metal", "metales"]),
         ("cnc", ["cnc", "router"]),
         ("plasma", ["plasma", "canteadora"]),
         ("chiller", ["chiller", "enfriador", "enfriamiento"]),
@@ -165,7 +264,7 @@ def filtrar_contexto_relevante(mensaje_usuario: str, contexto_completo: dict) ->
         "hola", "buenos dias", "buenas", "buen dia", "que venden", "qué venden",
         "catalogo", "catálogo", "categorias", "categorías", "productos", "servicios",
         "que tienen", "qué tienen", "info", "informacion", "información",
-        "co2", "fibra", "router", "cnc"
+        "co2", "fibra", "router", "cnc", "metal", "metales", "vendes", "qué vendes", "que vendes"
     ]
     es_consulta_generica = any(kw in mensaje_lower for kw in keywords_genericos)
     se_agregaron_categorias = False
@@ -181,11 +280,27 @@ def filtrar_contexto_relevante(mensaje_usuario: str, contexto_completo: dict) ->
     if necesita_info_tienda and contexto_completo["tienda"]:
         partes.append("[Contexto tienda]\n" + contexto_completo["tienda"])
     
-    # Buscar productos mencionados por nombre o características
+    # Buscar productos vía semántica en Chroma (solo si no es genérica)
     productos_relevantes = []
-
-    # Si la consulta es genérica (incluye co2/fibra/router/cnc o saludo/catalogo), evitamos listar productos
     if not es_consulta_generica:
+        filtros_cat = []
+        if "co2" in mensaje_lower:
+            filtros_cat.append("co2")
+        if any(term in mensaje_lower for term in ["fibra", "metal", "metales"]):
+            filtros_cat.append("fibra")
+        if any(term in mensaje_lower for term in ["cnc", "router"]):
+            filtros_cat.append("cnc")
+        if "plasma" in mensaje_lower:
+            filtros_cat.append("plasma")
+        try:
+            productos_sem = buscar_productos_semanticos(mensaje_usuario, filtros_categoria=filtros_cat or None, top_k=7)
+            if productos_sem:
+                productos_relevantes.extend(productos_sem)
+        except Exception as exc:
+            print(f"Chroma query failed: {exc}")
+
+    # Heurística legacy solo si no se encontraron productos semánticos y no es genérica
+    if not es_consulta_generica and not productos_relevantes:
         for producto in contexto_completo["productos"]:
             nombre = producto.get("nombre", "").lower()
             modelo = producto.get("modelo", "").lower()
@@ -320,13 +435,15 @@ def filtrar_contexto_relevante(mensaje_usuario: str, contexto_completo: dict) ->
         productos_str = "\n".join([json.dumps(p, ensure_ascii=False) for p in productos_con_links])
         partes.append("[Productos relevantes]\n" + productos_str)
 
-    # Añadir categorías recomendadas si es consulta genérica
+    # Añadir categorías recomendadas si es consulta genérica (siempre incluir y devolver temprano)
     categorias_links = contexto_completo.get("categorias_links", [])
     if es_consulta_generica and categorias_links:
         import json
         recomendadas = filtrar_categorias_por_keywords(categorias_links, mensaje_lower) or categorias_links[:5]
         partes.append("[Categorias recomendadas]\n" + json.dumps(recomendadas, ensure_ascii=False))
         se_agregaron_categorias = True
+        # Para consultas genéricas devolvemos solo categorías (evita que el modelo invente productos)
+        return "\n\n".join(partes)
     
     # Si no se detectó nada relevante, incluir info básica de la tienda por defecto
     if not partes:
@@ -369,11 +486,17 @@ async def classify_and_respond_with_groq(user_message: str) -> str:
         La respuesta del modelo o 'ESCALATE' si debe escalar a humano
     """
     if not groq_client:
+        print("[GROQ] ✗ Error: Groq API no configurada")
         return "Error: Groq API no configurada"
 
+    print(f"[GROQ] Cargando contexto...")
     # Cargar contexto completo y filtrar según mensaje del usuario
     contexto_completo = cargar_contexto_completo()
+    print(f"[GROQ] ✓ Contexto cargado: {len(contexto_completo['productos'])} productos")
+    
+    print(f"[GROQ] Filtrando contexto relevante...")
     contexto_filtrado = filtrar_contexto_relevante(user_message, contexto_completo)
+    print(f"[GROQ] ✓ Contexto filtrado ({len(contexto_filtrado)} chars)")
     
     system_prompt = SYSTEM_PROMPT
     
@@ -383,6 +506,7 @@ async def classify_and_respond_with_groq(user_message: str) -> str:
         system_prompt += "\n\nRespuesta basada EXCLUSIVAMENTE en el contexto anterior:"
 
     try:
+        print(f"[GROQ] Enviando a Groq con modelo llama-3.1-8b-instant...")
         chat_completion = await groq_client.chat.completions.create(
             messages=[
                 {
@@ -401,10 +525,26 @@ async def classify_and_respond_with_groq(user_message: str) -> str:
         )
 
         response = chat_completion.choices[0].message.content.strip()
+        print(f"[GROQ] ✓ Respuesta recibida: {response[:100]}...")
+        
+        # Debug: si es ESCALATE, mostrar el contexto para diagnosticar
+        if response.strip() == "ESCALATE":
+            print(f"[GROQ-DEBUG] ESCALATE detectado. Contexto enviado ({len(user_message)} chars):")
+            if "[Productos relevantes]" in user_message:
+                print("[GROQ-DEBUG] ✓ Hay [Productos relevantes] en el contexto")
+            else:
+                print("[GROQ-DEBUG] ! NO hay [Productos relevantes] en el contexto")
+            if "[Categorias recomendadas]" in user_message:
+                print("[GROQ-DEBUG] ✓ Hay [Categorias recomendadas] en el contexto")
+            else:
+                print("[GROQ-DEBUG] ! NO hay [Categorias recomendadas] en el contexto")
+        
         return response
 
     except Exception as e:
-        print(f"Error al llamar a Groq API: {e}")
+        print(f"[GROQ] ✗ Error al llamar a Groq API: {e}")
+        import traceback
+        traceback.print_exc()
         return "Lo siento, hubo un error al procesar tu mensaje."
 
 
@@ -457,8 +597,19 @@ async def process_incoming_message(sender_id: str, message_text: str) -> Dict[st
     Returns:
         Diccionario con información del procesamiento
     """
+    print(f"\n[PROCESS] Iniciando procesamiento de mensaje de {sender_id}")
+    print(f"[PROCESS] Texto: {message_text}")
+    
     # Obtener respuesta de Groq
-    groq_response = await classify_and_respond_with_groq(message_text)
+    try:
+        print(f"[PROCESS] Llamando a Groq...")
+        groq_response = await classify_and_respond_with_groq(message_text)
+        print(f"[PROCESS] ✓ Respuesta de Groq recibida: {groq_response[:100]}...")
+    except Exception as e:
+        print(f"[PROCESS] ✗ Error en Groq: {e}")
+        import traceback
+        traceback.print_exc()
+        groq_response = "Lo siento, hubo un error al procesar tu mensaje."
     
     result = {
         "sender_id": sender_id,
@@ -470,15 +621,20 @@ async def process_incoming_message(sender_id: str, message_text: str) -> Dict[st
     
     # Verificar si debe escalar
     if "ESCALATE" in groq_response.upper():
+        print(f"[PROCESS] Mensaje marcado para escalación")
         result["escalated"] = True
         # Enviar mensaje genérico
         escalation_message = "Gracias por tu consulta. Un representante se pondrá en contacto contigo pronto."
+        print(f"[PROCESS] Enviando mensaje de escalación a Facebook...")
         result["sent_to_facebook"] = await send_facebook_message(sender_id, escalation_message)
         result["final_message"] = escalation_message
     else:
         # Enviar la respuesta del bot
+        print(f"[PROCESS] Enviando respuesta a Facebook...")
         result["sent_to_facebook"] = await send_facebook_message(sender_id, groq_response)
         result["final_message"] = groq_response
+    
+    print(f"[PROCESS] Enviado a Facebook: {result['sent_to_facebook']}")
     
     # Guardar en buffer para que el frontend pueda consultarlo por polling.
     # Se almacena una vista simplificada para UI.
@@ -506,6 +662,7 @@ async def process_incoming_message(sender_id: str, message_text: str) -> Dict[st
     if len(MESSAGE_BUFFER) > 200:
         MESSAGE_BUFFER[:] = MESSAGE_BUFFER[-200:]
 
+    print(f"[PROCESS] ✓ Procesamiento completado\n")
     return result
 
 

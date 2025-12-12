@@ -11,6 +11,7 @@ from .backend import (
     parse_webhook_payload,
     process_incoming_message,
     get_message_buffer,
+    precargar_embedder,
 )
 
 
@@ -240,6 +241,13 @@ def message_card(msg: Dict) -> rx.Component:
 # Crear la app
 app = rx.App()
 app.add_page(index, route="/", on_load=State.refresh_messages)
+
+# Pre-cargar el modelo de embeddings en background para evitar timeout
+# en la primera petición del webhook
+print("[Init] Iniciando pre-carga de embedder en background...")
+import threading
+embedder_thread = threading.Thread(target=precargar_embedder, daemon=True)
+embedder_thread.start()
 
 
 # ==================== API ENDPOINTS ====================
